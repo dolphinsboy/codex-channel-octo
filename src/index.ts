@@ -11,7 +11,7 @@ import { safeNotice, type ReducedItemFacts } from './cards/redact.js';
  * OctoGateway.start → setMessageHandler wiring the full pipeline.
  */
 
-import { loadConfig, resolveBotConfigs, runtimeConfigPath } from './config.js';
+import { loadConfig, resolveBotConfigs, runtimeConfigPath, type Config } from './config.js';
 import { BotManager, type ManagedBot } from './bot-manager.js';
 import { watchConfig } from './config-watcher.js';
 import { createAdapter } from './db-adapter.js';
@@ -34,7 +34,7 @@ import { summarizeAgentError } from './agent-errors.js';
 import { sanitizeDisplayName, escapeSectionMarkers, sanitizePromptBody } from './prompt-safety.js';
 import type { SessionCtx } from './cwd-resolver.js';
 import { cleanupExpiredCwds, resolveSessionCwd } from './cwd-resolver.js';
-import { StreamRelay } from './stream-relay.js';
+import { StreamRelay, confirmedMessageId } from './stream-relay.js';
 import { sendReadReceipt, getChannelMessages, getUploadCredentials } from './octo/api.js';
 import type { HistoricalMessage } from './octo/api.js';
 import { ChannelType, MessageType } from './octo/types.js';
@@ -45,6 +45,9 @@ import { handleCommand } from './commands.js';
 import { loadGroupConfig } from './group-config.js';
 import { canLoadPrivateMemory, loadPrivateMemory, privateMemorySessionKey } from './private-memory.js';
 import { buildSenderContext } from './sender-context.js';
+import { createArtifactScope } from './artifact-files.js';
+import { DEFAULT_IMAGE_BYTES } from './artifacts.js';
+import { deliverImages, imageDeliverySummary } from './image-delivery.js';
 import { isConversationMdEvent } from './conversation-md.js';
 import { buildInlinedFileBody, truncateUtf8ByBytes, assembleUserMessage, MAX_USER_LLM_BYTES } from './file-inline-wrap.js';
 import { join } from 'node:path';
@@ -772,6 +775,14 @@ export async function handleMessage(
       if (eligibleForMemory) {
         sessionOpts = { ...(sessionOpts ?? {}), privateMemoryContext: loadPrivateMemory(config, msg, ownerUid) };
       }
+      // Host owns both the destination and the narrow per-turn export scope.
+      // Never authorize ordinary model-produced paths across the workspace.
+      const imageScope = config.sdk.nativeImages?.enabled === true && outputImagesWritable(config)
+        && (config.sdk.outputSelection ?? DEFAULT_OUTPUT_SELECTION_MODE) === 'final'
+        ? createArtifactScope(resolveSessionCwd(config.cwdBase ?? config.cwd, sessionCtx)) : undefined;
+      if (imageScope) {
+        sessionOpts.nativeImageOutput = { requestId: turn.turnId, directory: imageScope.directory };
+      }
       stage = 'inference'; turn.stage = stage;
       const agentEvents = queryAgentEvents(userContentForLLM, config, sessionCtx, undefined, sessionOpts, onSafeItem);
 
@@ -789,7 +800,8 @@ export async function handleMessage(
           if (ev.kind === 'work' && ['command_execution','file_change','mcp_tool_call'].includes(ev.itemType)) turn.executionRisk = 'effects_observed';
           collector.push(ev);
         }
-        selected = collector.select({ mode: outputMode, maxChars: config.maxResponseChars ?? DEFAULT_MAX_RESPONSE_CHARS });
+        selected = collector.select({ mode: outputMode, maxChars: config.maxResponseChars ?? DEFAULT_MAX_RESPONSE_CHARS,
+          ...(imageScope ? { artifactRequestId: turn.turnId } : {}) });
         console.log(describeSelection(selected, outputMode, collector.attemptCount));
         if (selected.text) {
           turn.assertPublishable();
@@ -812,6 +824,26 @@ export async function handleMessage(
         ? (uid: string): boolean => turnGroupContext.isMember(channelId, uid)
         : undefined;
       await streamRelay.deliver(channelId, channelType, selectedChunks(), config.apiUrl, config.botToken, config.maxResponseChars, outboundNameToUid, isValidMentionUid, { turn, store: turnStore });
+      if (imageScope && selected?.artifacts.length) {
+        turn.assertPublishable();
+        stage = 'delivery'; turn.stage = stage;
+        const images = await deliverImages({ artifacts: selected.artifacts, scope: imageScope,
+          maxBytes: config.sdk.nativeImages?.maxBytes ?? DEFAULT_IMAGE_BYTES,
+          apiUrl: config.apiUrl, botToken: config.botToken, channelId, channelType, turn, store: turnStore });
+        turn.assertPublishable();
+        const summary = imageDeliverySummary(images);
+        const summaryPart = turnStore.readDeliveryParts(turn.turnId).length;
+        const summaryKey = `${turn.turnId}-image-report`;
+        turnStore.saveDeliveryPart(turn.turnId, summaryPart, summaryKey, JSON.stringify({ channelId, channelType, content: summary }));
+        turnStore.markDeliveryPart(turn.turnId, summaryPart, 'unknown');
+        const ack = await sendMessage({ apiUrl: config.apiUrl, botToken: config.botToken, channelId, channelType,
+          clientMsgNo: summaryKey, content: summary });
+        turn.assertPublishable();
+        const summaryId = confirmedMessageId(ack?.message_id);
+        if (!summaryId) throw new AgentFailure({ stage: 'delivery', category: 'delivery_failed', source: 'octo_api', evidence: 'structured' });
+        turnStore.markDeliveryPart(turn.turnId, summaryPart, 'confirmed', summaryId);
+        turnStore.appendTurnOutputStatus(turn.turnId, summary);
+      }
 
       turn.assertPublishable();
       // G8: Send read receipt after processing (fire-and-forget)
@@ -908,6 +940,12 @@ export async function handleMessage(
       );
     }
   }
+}
+
+/** Honor the same double switch as the Codex workspace-write boundary. */
+function outputImagesWritable(config: Config): boolean {
+  return config.sdk.sandboxMode === 'danger-full-access'
+    || (config.sdk.sandboxMode === 'workspace-write' && config.sdk.allowWorkspaceWrite === true);
 }
 
 // ─── G1/G11 helpers ───────────────────────────────────────────────────────────────────
