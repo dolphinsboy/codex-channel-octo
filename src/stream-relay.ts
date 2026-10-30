@@ -18,7 +18,11 @@ import type { ChannelType } from "./octo/types.js";
 import {
   sendTyping,
   sendMessage,
+  sendImageMessage,
+  getUploadPresign,
+  uploadFileToPresignedUrl,
 } from "./octo/api.js";
+import type { OutboundImageStage, PreparedImage } from "./media-outbound.js";
 import { resolveMentions } from "./mention-utils.js";
 import { TRUNCATION_SUFFIX, DEFAULT_MAX_RESPONSE_CHARS } from "./output-selection.js";
 import { summarizeAgentError } from "./agent-errors.js";
@@ -149,7 +153,19 @@ export function splitMessage(
 // ─── StreamRelay ────────────────────────────────────────────────────────────
 
 export interface DeliveryPart { clientMsgNo: string; state: 'confirmed' | 'unknown'; messageId?: string; }
-export interface DeliveryReport { parts: DeliveryPart[]; }
+/**
+ * #95 image part. state mirrors the outbound image state machine:
+ * 'sent' = server confirmed a canonical message_id; 'unknown' = presign/put/send
+ * failed or the ack carried no valid id (delivery outcome unproven — NEVER
+ * resent, the bot endpoint has no idempotency contract); 'failed' is reserved
+ * for pre-delivery (validate) rejections recorded by the caller.
+ */
+export interface ImageDeliveryPart { kind: 'image'; clientMsgNo: string; name: string; state: 'sent' | 'failed' | 'unknown'; stage: OutboundImageStage; messageId?: string; error?: string; }
+export interface DeliveryReport { parts: Array<DeliveryPart | ImageDeliveryPart>; }
+/** Sanitized per-part error tag: stage + fixed category, never raw exception text (may carry the signed URL/credentials). */
+function imagePartError(stage: OutboundImageStage, error: unknown): string {
+  return error instanceof AgentFailure ? `${stage}:${error.snapshot.category}` : `${stage}:error`;
+}
 function confirmedMessageId(value: unknown): string | undefined {
   const id = typeof value === 'string' ? value : typeof value === 'number' && Number.isSafeInteger(value) ? String(value) : '';
   // parseOctoJson preserves large numeric tokens as strings, including malformed
@@ -164,7 +180,10 @@ export class StreamRelay {
    * 1. Starts a typing indicator heartbeat (5 s interval).
    * 2. Accumulates all chunks from the async iterable.
    * 3. Sends the accumulated text via plain sendMessage with splitting.
-   * 4. Always cleans up the typing heartbeat.
+   * 4. #95: sends prepared images (presign → PUT → Image message) AFTER all
+   *    text segments, in array order. `images` is read only after the stream
+   *    is fully drained — callers may fill the array from inside the iterable.
+   * 5. Always cleans up the typing heartbeat.
    */
   async deliver(
     channelId: string,
@@ -176,6 +195,7 @@ export class StreamRelay {
     memberMap?: Map<string, string>,
     isValidUid?: (uid: string) => boolean,
     lifecycle?: { turn: TurnContext; store: SessionStore },
+    images?: PreparedImage[],
   ): Promise<DeliveryReport> {
     const report: DeliveryReport = { parts: [] };
     const check = () => lifecycle?.turn.assertPublishable();
@@ -223,6 +243,7 @@ export class StreamRelay {
       }
 
       // Send accumulated text via plain messages with splitting.
+      const pending: Array<Parameters<typeof sendMessage>[0]> = [];
       if (accumulated.length > 0) {
         // P0-1: Resolve @[uid:name] structured mentions and @name ONCE on the
         // full accumulated text, BEFORE splitting. This guarantees splitMessage
@@ -244,7 +265,6 @@ export class StreamRelay {
         const segments = splitMessage(finalContent, undefined, protectedRanges);
         let segStart = 0;
         let mentionAllConsumed = false;
-        const pending: Array<Parameters<typeof sendMessage>[0]> = [];
         for (const segment of segments) {
           const segEnd = segStart + segment.length;
           // Partition entities falling within this segment, re-rebase to
@@ -281,43 +301,116 @@ export class StreamRelay {
           });
           segStart = segEnd;
         }
+      }
+      // #95: prepared images ride the same durable ledger as text parts, with
+      // contiguous part_index. Read ONLY after the stream is fully drained —
+      // index.ts fills the array from inside the iterable. Payloads carry
+      // name/size/contentType only: never local paths, file bodies or URLs.
+      const imageParts = (images ?? []).map(image => ({ clientMsgNo: randomUUID(), image }));
+      // Persist fixed payloads/keys before the first external send. Never persist the token.
+      if (pending.length > 0 || imageParts.length > 0) {
         check();
-        try { lifecycle?.store.saveDeliveryParts(lifecycle.turn.turnId, pending.map(part => ({ clientMsgNo: part.clientMsgNo!, payload: JSON.stringify({
-          channelId, channelType, content: part.content, mentionUids: part.mentionUids,
-          mentionEntities: part.mentionEntities, mentionAll: part.mentionAll,
-        }) })));
+        try { lifecycle?.store.saveDeliveryParts(lifecycle.turn.turnId, [
+          ...pending.map(part => ({ clientMsgNo: part.clientMsgNo!, payload: JSON.stringify({
+            channelId, channelType, content: part.content, mentionUids: part.mentionUids,
+            mentionEntities: part.mentionEntities, mentionAll: part.mentionAll,
+          }) })),
+          ...imageParts.map(entry => ({ clientMsgNo: entry.clientMsgNo, payload: JSON.stringify({
+            kind: 'image', channelId, channelType,
+            name: entry.image.name, size: entry.image.size, contentType: entry.image.contentType,
+          }) })),
+        ]);
         } catch { throw new AgentFailure({ stage: 'history_commit', category: 'history_failed', source: 'local', evidence: 'structured' }); }
-        for (const [index, part] of pending.entries()) {
+      }
+      for (const [index, part] of pending.entries()) {
+        check();
+        try {
+          lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, index, 'unknown');
+          const result = await sendMessage(part);
           check();
-          try {
-            lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, index, 'unknown');
-            const result = await sendMessage(part);
-            check();
-            // The send endpoint can return a server-generated client_msg_no.
-            // Correlate this acknowledgement through the awaited HTTP request;
-            // the returned key need not echo our local correlation key. The bot
-            // endpoint does not establish idempotency from this request field.
-            const id = confirmedMessageId(result?.message_id);
-            const state = id ? 'confirmed' : 'unknown';
-            lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, index, state, id);
-            report.parts.push({ clientMsgNo: part.clientMsgNo!, state, ...(id ? { messageId: id } : {}) });
-            if (!id && lifecycle) throw new AgentFailure({ stage: 'delivery', category: 'delivery_failed', source: 'octo_api', evidence: 'structured' });
-          } catch (error) {
-            if (lifecycle?.turn.signal.aborted) throw error;
-            lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, index, 'unknown');
-            if (lifecycle) throw error instanceof AgentFailure ? error : new AgentFailure({ stage: 'delivery', category: 'delivery_failed', source: 'octo_api', evidence: 'structured' });
-            console.error(`[stream-relay] delivery failed: ${summarizeAgentError(error)}`);
-          }
+          // The send endpoint can return a server-generated client_msg_no.
+          // Correlate this acknowledgement through the awaited HTTP request;
+          // the returned key need not echo our local correlation key. The bot
+          // endpoint does not establish idempotency from this request field.
+          const id = confirmedMessageId(result?.message_id);
+          const state = id ? 'confirmed' : 'unknown';
+          lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, index, state, id);
+          report.parts.push({ clientMsgNo: part.clientMsgNo!, state, ...(id ? { messageId: id } : {}) });
+          if (!id && lifecycle) throw new AgentFailure({ stage: 'delivery', category: 'delivery_failed', source: 'octo_api', evidence: 'structured' });
+        } catch (error) {
+          if (lifecycle?.turn.signal.aborted) throw error;
+          lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, index, 'unknown');
+          if (lifecycle) throw error instanceof AgentFailure ? error : new AgentFailure({ stage: 'delivery', category: 'delivery_failed', source: 'octo_api', evidence: 'structured' });
+          console.error(`[stream-relay] delivery failed: ${summarizeAgentError(error)}`);
         }
       }
-      // Persist fixed payloads/keys before the first external send. Never persist the token.
       // Delivery uncertainty stops later segments; it must not trigger model replay.
       // If accumulated is empty, the agent produced no output — nothing to send.
       // If the stream threw mid-way, we've now flushed whatever partial text was
       // accumulated; re-throw so the caller's error handling still runs (it will
       // not double-send — the partial was delivered here, the caller only logs /
-      // surfaces the failure).
+      // surfaces the failure). Image delivery is skipped on a failed stream.
       if (streamError !== undefined) throw streamError;
+      // #95: all text segments are out; deliver images one by one in instruction
+      // order (README ordering contract). Any presign/put/send failure or a
+      // missing valid message_id leaves the part 'unknown' — never resent (no
+      // server-side idempotency contract). Local validate rejections are
+      // recorded by the caller and never reach this loop.
+      for (const [offset, entry] of imageParts.entries()) {
+        const index = pending.length + offset;
+        const { clientMsgNo, image } = entry;
+        let stage: OutboundImageStage = 'presign';
+        try {
+          check();
+          lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, index, 'unknown');
+          const presign = await getUploadPresign({
+            apiUrl, botToken, filename: image.name, fileSize: image.size, contentType: image.contentType,
+            ...(lifecycle ? { signal: lifecycle.turn.signal } : {}),
+          });
+          stage = 'put';
+          const uploaded = await uploadFileToPresignedUrl({
+            uploadUrl: presign.uploadUrl, downloadUrl: presign.downloadUrl,
+            fileBody: image.body, fileSize: image.size,
+            // Replay the signed headers VERBATIM — any deviation is a 403 (SigV4 canonical headers).
+            contentType: presign.contentType,
+            ...(presign.contentDisposition !== undefined ? { contentDisposition: presign.contentDisposition } : {}),
+            ...(lifecycle ? { signal: lifecycle.turn.signal } : {}),
+          });
+          stage = 'send';
+          check();
+          const result = await sendImageMessage({
+            apiUrl, botToken, channelId, channelType, url: uploaded.url,
+            name: image.name, size: image.size,
+            ...(image.width !== undefined ? { width: image.width } : {}),
+            ...(image.height !== undefined ? { height: image.height } : {}),
+            ...(image.caption !== undefined ? { caption: image.caption } : {}),
+            clientMsgNo,
+            ...(lifecycle ? { signal: lifecycle.turn.signal } : {}),
+          });
+          check();
+          const id = confirmedMessageId(result?.message_id);
+          if (id) {
+            lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, index, 'confirmed', id);
+            report.parts.push({ kind: 'image', clientMsgNo, name: image.name, state: 'sent', stage, messageId: id });
+          } else {
+            report.parts.push({ kind: 'image', clientMsgNo, name: image.name, state: 'unknown', stage });
+          }
+        } catch (error) {
+          if (lifecycle?.turn.signal.aborted) {
+            // Cancelled: best-effort mark this and the remaining images unknown
+            // (the guarded store may refuse writes), then propagate the AbortError.
+            for (let rest = offset; rest < imageParts.length; rest++) {
+              try { lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, pending.length + rest, 'unknown'); } catch { /* ownership already revoked */ }
+            }
+            throw error;
+          }
+          lifecycle?.store.markDeliveryPart(lifecycle.turn.turnId, index, 'unknown');
+          report.parts.push({ kind: 'image', clientMsgNo, name: image.name, state: 'unknown', stage, error: imagePartError(stage, error) });
+          console.error(`[stream-relay] image delivery failed at ${stage}: ${summarizeAgentError(error)}`);
+          // No rethrow: the text is already out; one failed image must not fail the
+          // turn — continue with the remaining images (per-item partial success).
+        }
+      }
       return report;
     } finally {
       clearInterval(typingTimer);

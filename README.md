@@ -327,6 +327,28 @@ Isolated by default. To enable interop, point a per-bot `sdk.codexHome` at your 
 
 After that, a bot's group conversation can be resumed in your terminal with `codex exec resume <threadId>`. **Note: IM content then enters your personal Codex session history.**
 
+## Image messages
+
+Three independent paths move images between Octo and the agent. They do not overlap: the adapter never scans reply text for local paths, markdown images or URLs — native outbound delivery only happens for explicit `octo-artifact` directives.
+
+| Path | Direction | How it works | Requirements / limits |
+|---|---|---|---|
+| Native inbound (#86) | user → agent | Image/GIF/RichText message URLs are downloaded into the session cwd (`.cc-octo-media/`) so Codex can `Read` them | Server delivers a media URL; ≤ 5 MB per image; ≤ 6 images per message; content-type must be png/jpeg/gif/webp; SSRF-guarded |
+| Native outbound (#95) | agent → user | The model emits an `octo-artifact` fenced block; the adapter validates the file, uploads it via `GET /v1/bot/upload/presigned` + a single signed `PUT`, then sends a native `Image` (type=2) message | File must live inside the session cwd (symlink escape rejected); real image magic bytes required (png/jpeg/gif/webp); ≤ 5 MB each; ≤ 6 images per reply; server needs the presigned-upload endpoint with object storage configured (`file.max_size_kb` applies) |
+| octo-cli skill (external) | agent → user | The model itself runs the `octo-cli` skill inside the sandbox to upload/send files | Skill installed in the session and sandbox network access enabled (`sdk.networkAccessEnabled`, or `danger-full-access`); the adapter neither mediates nor deduplicates this path — instruct the model to deliver a given file through exactly one path |
+
+`octo-artifact` block format — exactly one JSON object; the info string must match exactly:
+
+````markdown
+```octo-artifact
+{"kind":"image","path":"charts/out.png","caption":"optional"}
+```
+````
+
+Outbound ordering contract: all text segments are delivered first (existing splitting rules), then images one by one in block order. The block itself is removed from the visible reply; a block with invalid JSON is shown as-is and never uploaded. Every `image/*` format — including GIF — is sent as `Image` (type=2) and renders as an image; `GIF` (type=3) is deliberately not used in V1.
+
+Failure handling: every image carries a stage tag (`validate` / `presign` / `put` / `send`). Each rejected or unconfirmed image is reported per item (`图片发送未完成：name [stage:reason]`); an unconfirmed delivery stays `unknown` and is never resent (the bot send endpoint has no idempotency contract). An image failure never re-runs the model or the original task, and errors/logs never contain presigned URLs, signatures or tokens.
+
 ## Differences from the Claude edition
 
 | | cc-channel-octo | codex-channel-octo |

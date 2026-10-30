@@ -8,7 +8,7 @@ export type ExecutionRisk = 'proven_not_started' | 'effects_observed' | 'unknown
 export type RecoveryDecision = 'not_attempted' | 'blocked_uncertain' | 'exhausted' | 'cancelled' | 'fresh_retried';
 export type OctoEndpoint = '/v1/bot/sendMessage' | '/v1/bot/register' | '/v1/bot/typing'
   | '/v1/bot/heartbeat' | '/v1/bot/readReceipt' | '/v1/bot/messages/sync'
-  | '/v1/bot/upload/credentials' | '/v1/bot/groups/:group/md'
+  | '/v1/bot/upload/credentials' | '/v1/bot/upload/presigned' | '/v1/bot/groups/:group/md'
   | '/v1/bot/groups/:group/threads/:thread/md' | '/v1/bot/groups/:group/mention_pref'
   | '/v1/bot/groups/:group/members' | 'other';
 export interface FailureSnapshot {

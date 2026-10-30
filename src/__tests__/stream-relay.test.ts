@@ -3,7 +3,9 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { splitMessage } from "../stream-relay.js";
+import { splitMessage, type ImageDeliveryPart } from "../stream-relay.js";
+import { TurnContext } from "../turn-context.js";
+import type { PreparedImage } from "../media-outbound.js";
 
 // ─── splitMessage ───────────────────────────────────────────────────────────
 
@@ -119,17 +121,31 @@ interface ApiCall {
 const mockState = vi.hoisted(() => {
   const calls: ApiCall[] = [];
   let sendMessageFail = false;
+  let presignFail = false;
+  let putFail = false;
+  let imageSendMode: "ok" | "throw" | "noid" = "ok";
   return {
     calls,
     get sendMessageFail() { return sendMessageFail; },
     set sendMessageFail(v: boolean) { sendMessageFail = v; },
+    get presignFail() { return presignFail; },
+    set presignFail(v: boolean) { presignFail = v; },
+    get putFail() { return putFail; },
+    set putFail(v: boolean) { putFail = v; },
+    get imageSendMode() { return imageSendMode; },
+    set imageSendMode(v: "ok" | "throw" | "noid") { imageSendMode = v; },
     reset() {
       calls.length = 0;
       sendMessageFail = false;
+      presignFail = false;
+      putFail = false;
+      imageSendMode = "ok";
     },
   };
 });
 
+// Fake secrets embedded in mock errors/URLs — the redaction test asserts they
+// never surface in DeliveryReport parts or console output.
 vi.mock("../octo/api.js", () => ({
   sendTyping: vi.fn(async (params: Record<string, unknown>) => {
     mockState.calls.push({ fn: "sendTyping", args: params });
@@ -137,7 +153,37 @@ vi.mock("../octo/api.js", () => ({
   sendMessage: vi.fn(async (params: Record<string, unknown>) => {
     mockState.calls.push({ fn: "sendMessage", args: params });
     if (mockState.sendMessageFail) throw new Error("sendMessage failed");
-    return { message_id: "msg_1", client_msg_no: "c1", message_seq: 1 };
+    // Canonical int64-shaped id so lifecycle tests reach the confirmed path.
+    return { message_id: "9001", client_msg_no: "c1", message_seq: 1 };
+  }),
+  getUploadPresign: vi.fn(async (params: Record<string, unknown>) => {
+    mockState.calls.push({ fn: "getUploadPresign", args: params });
+    if (mockState.presignFail) {
+      // Simulated leak source: exception text carrying a signed URL + credentials.
+      throw new Error("presign refused: https://storage.test/u?X-Amz-Signature=SIGSECRET123&x-session-token=TOKENSECRET456 tmpSecretKey=KEYSECRET789");
+    }
+    return {
+      uploadUrl: `https://storage.test/upload/${String(params.filename)}?X-Amz-Signature=SIGSECRET123&x-session-token=TOKENSECRET456`,
+      downloadUrl: `https://cdn.test/media/${String(params.filename)}`,
+      contentType: params.contentType ?? "application/octet-stream",
+    };
+  }),
+  uploadFileToPresignedUrl: vi.fn(async (params: Record<string, unknown>) => {
+    mockState.calls.push({ fn: "uploadFileToPresignedUrl", args: params });
+    if (mockState.putFail) {
+      throw new Error(`PUT rejected: ${String(params.uploadUrl)} tmpSecretKey=KEYSECRET789`);
+    }
+    return { url: params.downloadUrl };
+  }),
+  sendImageMessage: vi.fn(async (params: Record<string, unknown>) => {
+    mockState.calls.push({ fn: "sendImageMessage", args: params });
+    if (mockState.imageSendMode === "throw") {
+      throw new Error("send lost after upload to https://cdn.test/x?sig=SIGSECRET123 sessionToken=TOKENSECRET456 tmpSecretKey=KEYSECRET789");
+    }
+    if (mockState.imageSendMode === "noid") {
+      return { message_id: "not-canonical", client_msg_no: "c", message_seq: 1 };
+    }
+    return { message_id: "9001", client_msg_no: params.clientMsgNo, message_seq: 1 };
   }),
 }));
 
@@ -504,5 +550,211 @@ describe("StreamRelay", () => {
         expect(next).toBeLessThanOrEqual(0xDFFF);
       }
     }
+  });
+
+  // ─── #95: outbound image delivery ─────────────────────────────────────────
+
+  function makeImage(name: string, width?: number, height?: number): PreparedImage {
+    return {
+      name,
+      size: 1234,
+      contentType: "image/png",
+      ...(width !== undefined ? { width } : {}),
+      ...(height !== undefined ? { height } : {}),
+      body: Buffer.from(`bytes-of-${name}`),
+    };
+  }
+
+  function imageCalls(fn: string): ApiCall[] {
+    return mockState.calls.filter((c) => c.fn === fn);
+  }
+
+  it("case 4: delivers [text1, text2, image1, image2] in order with exact payloads", async () => {
+    // An earlier test permanently overrides the shared sendMessage mock with a
+    // non-canonical message_id ("msg_1"); lifecycle delivery requires canonical
+    // ids, so restore a deterministic implementation for this test.
+    const { sendMessage } = await import("../octo/api.js");
+    (sendMessage as ReturnType<typeof vi.fn>).mockImplementation(async (params: Record<string, unknown>) => {
+      mockState.calls.push({ fn: "sendMessage", args: params });
+      return { message_id: "9001", client_msg_no: "c1", message_seq: 1 };
+    });
+
+    const turn = new TurnContext(0);
+    const store = { saveDeliveryParts: vi.fn(), markDeliveryPart: vi.fn() };
+    const text = "a".repeat(2000) + "\n\n" + "b".repeat(2000); // → 2 segments
+    const img1 = makeImage("one.png", 11, 22);
+    const img2 = makeImage("two.png", 33, 44);
+
+    const promise = relay.deliver(
+      CH_ID, CH_TYPE, asyncChunks([text]), API_URL, BOT_TOKEN,
+      undefined, undefined, undefined,
+      { turn, store: store as never },
+      [img1, img2],
+    );
+    await vi.runAllTimersAsync();
+    const report = await promise;
+
+    // Order: every text segment first, then images in array order.
+    const order = mockState.calls
+      .filter((c) => c.fn === "sendMessage" || c.fn === "sendImageMessage")
+      .map((c) => c.fn);
+    expect(order).toEqual(["sendMessage", "sendMessage", "sendImageMessage", "sendImageMessage"]);
+
+    const textCalls = imageCalls("sendMessage");
+    expect((textCalls[0].args as { content: string }).content).toBe("a".repeat(2000) + "\n\n");
+    expect((textCalls[1].args as { content: string }).content).toBe("b".repeat(2000));
+
+    // Image payload metadata must match the prepared upload products exactly.
+    const sends = imageCalls("sendImageMessage");
+    expect(sends[0].args).toMatchObject({
+      channelId: CH_ID, channelType: CH_TYPE,
+      url: "https://cdn.test/media/one.png", name: "one.png", size: 1234, width: 11, height: 22,
+    });
+    expect(sends[1].args).toMatchObject({
+      url: "https://cdn.test/media/two.png", name: "two.png", size: 1234, width: 33, height: 44,
+    });
+
+    // presign gets the exact byte count + sniffed type; PUT replays the signed
+    // contentType and the very same body buffer.
+    const presigns = imageCalls("getUploadPresign");
+    expect(presigns[0].args).toMatchObject({ filename: "one.png", fileSize: 1234, contentType: "image/png" });
+    const puts = imageCalls("uploadFileToPresignedUrl");
+    expect((puts[0].args as { contentType: string }).contentType).toBe("image/png");
+    expect((puts[0].args as { fileBody: Buffer }).fileBody.equals(img1.body)).toBe(true);
+
+    // Report: 2 text parts + 2 sent image parts.
+    expect(report.parts).toHaveLength(4);
+    expect(report.parts[2]).toMatchObject({ kind: "image", state: "sent", stage: "send", name: "one.png", messageId: "9001" });
+    expect(report.parts[3]).toMatchObject({ kind: "image", state: "sent", name: "two.png" });
+
+    // Durable ledger: ONE save with 4 contiguous entries; image payloads carry
+    // name/size/contentType only — never local paths, bodies or presigned URLs.
+    expect(store.saveDeliveryParts).toHaveBeenCalledTimes(1);
+    const saved = (store.saveDeliveryParts.mock.calls[0] as unknown as [string, Array<{ clientMsgNo: string; payload: string }>])[1];
+    expect(saved).toHaveLength(4);
+    const imgPayload = JSON.parse(saved[2].payload) as Record<string, unknown>;
+    expect(imgPayload).toMatchObject({ kind: "image", name: "one.png", size: 1234, contentType: "image/png" });
+    expect("path" in imgPayload).toBe(false);
+    expect("body" in imgPayload).toBe(false);
+    expect(saved[2].payload).not.toContain("storage.test");
+    expect(store.markDeliveryPart).toHaveBeenCalledWith(turn.turnId, 2, "confirmed", "9001");
+    expect(store.markDeliveryPart).toHaveBeenCalledWith(turn.turnId, 3, "confirmed", "9001");
+  });
+
+  it("case 9: PUT failure → unknown with put stage tag; generation is never re-run", async () => {
+    mockState.putFail = true;
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // The "generation" already happened exactly once per image before delivery.
+      const generateImage = vi.fn((name: string) => makeImage(name));
+      const images = [generateImage("gen1.png"), generateImage("gen2.png")];
+
+      const promise = relay.deliver(
+        CH_ID, CH_TYPE, asyncChunks([]), API_URL, BOT_TOKEN,
+        undefined, undefined, undefined, undefined, images,
+      );
+      await vi.runAllTimersAsync();
+      const report = await promise; // must NOT reject — text-less, image-failed turn still reports
+
+      const imgParts = report.parts.filter((p): p is ImageDeliveryPart => "kind" in p && p.kind === "image");
+      expect(imgParts).toHaveLength(2);
+      for (const part of imgParts) {
+        expect(part.state).toBe("unknown"); // delivery outcome unproven — never "failed", never "sent"
+        expect(part.stage).toBe("put");
+        expect(part.error).toContain("put"); // stage-locatable error tag
+      }
+      // A delivery failure NEVER re-triggers image generation…
+      expect(generateImage).toHaveBeenCalledTimes(2);
+      // …and both images are attempted (partial success), none sent.
+      expect(imageCalls("uploadFileToPresignedUrl")).toHaveLength(2);
+      expect(imageCalls("sendImageMessage")).toHaveLength(0);
+    } finally {
+      logs.mockRestore();
+    }
+  });
+
+  it("case 10: send response lost → unknown, never resent; garbage ack id → unknown", async () => {
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // Network error on the image sendMessage: exactly ONE call, state unknown.
+      mockState.imageSendMode = "throw";
+      let promise = relay.deliver(
+        CH_ID, CH_TYPE, asyncChunks([]), API_URL, BOT_TOKEN,
+        undefined, undefined, undefined, undefined, [makeImage("lost.png")],
+      );
+      await vi.runAllTimersAsync();
+      let report = await promise;
+      let part = report.parts.find((p): p is ImageDeliveryPart => "kind" in p && p.kind === "image");
+      expect(part).toMatchObject({ state: "unknown", stage: "send", name: "lost.png" });
+      expect(imageCalls("sendImageMessage")).toHaveLength(1); // no resend
+
+      // Response arrives but the ack carries no canonical message_id → unknown, no resend.
+      mockState.reset();
+      mockState.imageSendMode = "noid";
+      promise = relay.deliver(
+        CH_ID, CH_TYPE, asyncChunks([]), API_URL, BOT_TOKEN,
+        undefined, undefined, undefined, undefined, [makeImage("noid.png")],
+      );
+      await vi.runAllTimersAsync();
+      report = await promise;
+      part = report.parts.find((p): p is ImageDeliveryPart => "kind" in p && p.kind === "image");
+      expect(part).toMatchObject({ state: "unknown", stage: "send", name: "noid.png" });
+      expect(part!.messageId).toBeUndefined();
+      expect(imageCalls("sendImageMessage")).toHaveLength(1); // no resend
+    } finally {
+      logs.mockRestore();
+    }
+  });
+
+  it("case 11: signatures/sessionToken/tmpSecretKey never leak via parts or console", async () => {
+    const secrets = ["SIGSECRET123", "TOKENSECRET456", "KEYSECRET789"];
+    const logs = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warns = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (const mode of ["presign", "put", "send"] as const) {
+        mockState.reset();
+        mockState.presignFail = mode === "presign";
+        mockState.putFail = mode === "put";
+        mockState.imageSendMode = mode === "send" ? "throw" : "ok";
+
+        const promise = relay.deliver(
+          CH_ID, CH_TYPE, asyncChunks(["text body"]), API_URL, BOT_TOKEN,
+          undefined, undefined, undefined, undefined, [makeImage("leak.png")],
+        );
+        await vi.runAllTimersAsync();
+        const report = await promise;
+
+        const dumped = JSON.stringify(report.parts)
+          + JSON.stringify(logs.mock.calls)
+          + JSON.stringify(warns.mock.calls);
+        for (const secret of secrets) {
+          expect(dumped, `secret ${secret} leaked in ${mode} mode`).not.toContain(secret);
+        }
+        const part = report.parts.find((p): p is ImageDeliveryPart => "kind" in p && p.kind === "image");
+        expect(part).toBeDefined();
+        expect(part!.state).toBe("unknown");
+        expect(part!.error).toBe(`${mode}:error`); // fixed tag, no raw exception text
+      }
+    } finally {
+      logs.mockRestore();
+      warns.mockRestore();
+    }
+  });
+
+  it("case 12: abort before image delivery → AbortError, zero image API calls", async () => {
+    const turn = new TurnContext(0);
+    const store = { saveDeliveryParts: vi.fn(), markDeliveryPart: vi.fn() };
+    turn.cancel(); // revoked before deliver starts — images must never be touched
+
+    const promise = relay.deliver(
+      CH_ID, CH_TYPE, asyncChunks([]), API_URL, BOT_TOKEN,
+      undefined, undefined, undefined,
+      { turn, store: store as never },
+      [makeImage("cancelled.png")],
+    );
+    await expect(promise).rejects.toMatchObject({ name: "AbortError" });
+    expect(imageCalls("getUploadPresign")).toHaveLength(0);
+    expect(imageCalls("uploadFileToPresignedUrl")).toHaveLength(0);
+    expect(imageCalls("sendImageMessage")).toHaveLength(0);
   });
 });

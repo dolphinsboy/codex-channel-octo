@@ -54,6 +54,7 @@ export function parseOctoJson<T>(text: string): T {
 const FIXED_ENDPOINTS: readonly OctoEndpoint[] = [
   '/v1/bot/sendMessage', '/v1/bot/register', '/v1/bot/typing', '/v1/bot/heartbeat',
   '/v1/bot/readReceipt', '/v1/bot/messages/sync', '/v1/bot/upload/credentials',
+  '/v1/bot/upload/presigned',
 ];
 function safeEndpoint(path: string): OctoEndpoint {
   const bare = path.split('?')[0];
@@ -169,6 +170,46 @@ export async function sendMessage(params: {
 }
 
 /**
+ * Send a native Image(type=2) message (#95).
+ *
+ * Payload mirrors the server's canonical ImagePayload contract
+ * (octo-server modules/messages_search/source.go: url required;
+ * caption/name/width/height optional). V1 sends every image/* format —
+ * including GIF — as Image(type=2); GIF(type=3) carries only a url and
+ * renders no worse, so it is deliberately not used.
+ */
+export async function sendImageMessage(params: {
+  apiUrl: string;
+  botToken: string;
+  channelId: string;
+  channelType: ChannelType;
+  url: string;
+  name?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  caption?: string;
+  clientMsgNo?: string;
+  signal?: AbortSignal;
+}): Promise<SendMessageResult | undefined> {
+  const payload: Record<string, unknown> = {
+    type: MessageType.Image,
+    url: params.url,
+  };
+  if (params.name) payload.name = params.name;
+  if (params.size != null) payload.size = params.size;
+  if (params.width) payload.width = params.width;
+  if (params.height) payload.height = params.height;
+  if (params.caption) payload.caption = params.caption;
+  return await postJson<SendMessageResult>(params.apiUrl, params.botToken, "/v1/bot/sendMessage", {
+    channel_id: params.channelId,
+    channel_type: params.channelType,
+    payload,
+    client_msg_no: params.clientMsgNo ?? generateClientMsgNo(),
+  }, params.signal);
+}
+
+/**
  * Get STS temporary credentials for direct COS upload.
  * GET /v1/bot/upload/credentials?filename=<encoded>
  *
@@ -223,6 +264,107 @@ export async function getUploadCredentials(params: {
     expiredTime: number;
     cdnBaseUrl?: string;
   };
+}
+
+// ─── Presigned Upload (#95) ─────────────────────────────────────────────────
+
+/**
+ * Get a presigned PUT URL for direct, backend-agnostic file upload.
+ * GET /v1/bot/upload/presigned?filename=&fileSize=[&contentType=]
+ *
+ * Ported from openclaw-channel-octo v1.0.13, re-expressed with this repo's
+ * apiFailure/rejectResponse error model: HTTP failures surface as structured
+ * AgentFailure and NEVER echo the server body (it may contain credentials).
+ *
+ * `fileSize` must be the exact byte count of the body the caller will PUT:
+ * SigV4 backends sign it as Content-Length, so any mismatch at PUT time is
+ * a 403 SignatureDoesNotMatch.
+ */
+export async function getUploadPresign(params: {
+  apiUrl: string;
+  botToken: string;
+  filename: string;
+  fileSize: number;
+  contentType?: string;
+  signal?: AbortSignal;
+}): Promise<{
+  uploadUrl: string;
+  downloadUrl: string;
+  contentType: string;
+  contentDisposition?: string;
+}> {
+  if (!Number.isInteger(params.fileSize) || params.fileSize <= 0) {
+    throw new Error(`getUploadPresign requires a positive integer fileSize (got ${params.fileSize})`);
+  }
+  const path = '/v1/bot/upload/presigned';
+  const query = new URLSearchParams({ filename: params.filename, fileSize: String(params.fileSize) });
+  if (params.contentType) query.set('contentType', params.contentType);
+  const url = `${params.apiUrl.replace(/\/+$/, "")}${path}?${query}`;
+  const effectiveSignal = params.signal ? AbortSignal.any([params.signal, AbortSignal.timeout(DEFAULT_TIMEOUT_MS)]) : AbortSignal.timeout(DEFAULT_TIMEOUT_MS);
+  const response = await request(path, url, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${params.botToken}` },
+    signal: effectiveSignal,
+  });
+  if (!response.ok) return rejectResponse(path, response);
+  const data = parseResponse<Record<string, unknown>>(path, response.status, await responseText(path, response));
+  // Validate required fields to catch backend API changes early.
+  const missing = ['uploadUrl', 'downloadUrl'].filter(k => typeof data[k] !== 'string');
+  if (missing.length > 0) {
+    throw new Error(`Octo API ${path} returned incomplete response: missing ${missing.join(', ')}`);
+  }
+  return {
+    uploadUrl: data.uploadUrl as string,
+    downloadUrl: data.downloadUrl as string,
+    contentType: typeof data.contentType === 'string' ? data.contentType : 'application/octet-stream',
+    ...(typeof data.contentDisposition === 'string' ? { contentDisposition: data.contentDisposition } : {}),
+  };
+}
+
+/**
+ * Upload a file body with a single PUT to a server-issued presigned URL.
+ *
+ * `contentType` / `contentDisposition` must be replayed VERBATIM from the
+ * presign response — both are folded into the SigV4 canonical headers, so
+ * omitting or altering either is a 403 SignatureDoesNotMatch.
+ *
+ * Errors never carry the uploadUrl (its query IS the signature) or the
+ * storage error body; failures surface as structured AgentFailure tagged
+ * with the /v1/bot/upload/presigned endpoint.
+ */
+export async function uploadFileToPresignedUrl(params: {
+  uploadUrl: string;
+  downloadUrl: string;
+  fileBody: Buffer;
+  fileSize: number;
+  contentType: string;
+  contentDisposition?: string;
+  signal?: AbortSignal;
+}): Promise<{ url: string }> {
+  const path = '/v1/bot/upload/presigned';
+  const headers: Record<string, string> = {
+    "Content-Type": params.contentType,
+    "Content-Length": String(params.fileSize),
+    ...(params.contentDisposition ? { "Content-Disposition": params.contentDisposition } : {}),
+  };
+  let response: Response;
+  try {
+    response = await fetch(params.uploadUrl, {
+      method: "PUT",
+      headers,
+      body: params.fileBody,
+      signal: params.signal,
+    });
+  } catch {
+    if (params.signal?.aborted) throw new DOMException('Octo upload cancelled', 'AbortError');
+    throw apiFailure(path, undefined, 'network');
+  }
+  if (!response.ok) {
+    // Drop the storage error body unread: it may echo the signed URL or keys.
+    try { await response.body?.cancel(); } catch { /* preserve the HTTP failure */ }
+    throw apiFailure(path, response.status, 'http_status');
+  }
+  return { url: params.downloadUrl };
 }
 
 // ─── Typing / Heartbeat ─────────────────────────────────────────────────────

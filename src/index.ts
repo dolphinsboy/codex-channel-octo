@@ -34,7 +34,8 @@ import { summarizeAgentError } from './agent-errors.js';
 import { sanitizeDisplayName, escapeSectionMarkers, sanitizePromptBody } from './prompt-safety.js';
 import type { SessionCtx } from './cwd-resolver.js';
 import { cleanupExpiredCwds, resolveSessionCwd } from './cwd-resolver.js';
-import { StreamRelay } from './stream-relay.js';
+import { StreamRelay, type ImageDeliveryPart } from './stream-relay.js';
+import { extractArtifacts, prepareOutboundImage, type OutboundImageResult, type PreparedImage } from './media-outbound.js';
 import { sendReadReceipt, getChannelMessages, getUploadCredentials } from './octo/api.js';
 import type { HistoricalMessage } from './octo/api.js';
 import { ChannelType, MessageType } from './octo/types.js';
@@ -781,6 +782,11 @@ export async function handleMessage(
       // the agent throws, nothing is yielded, delivered or stored.
       const outputMode = (config.sdk.outputSelection ?? DEFAULT_OUTPUT_SELECTION_MODE) as OutputSelectionMode;
       let selected: SelectedOutput | undefined;
+      // #95: outbound image queues. Filled while the relay drains the generator
+      // (after selection, before the text yield) and read by deliver() only after
+      // the stream is exhausted — both sides rely on the drain-before-deliver order.
+      const outboundImages: PreparedImage[] = [];
+      const outboundImageFailures: OutboundImageResult[] = [];
       async function* selectedChunks(): AsyncIterable<string> {
         const collector = new OutputCollector();
         for await (const ev of agentEvents) {
@@ -791,6 +797,24 @@ export async function handleMessage(
         }
         selected = collector.select({ mode: outputMode, maxChars: config.maxResponseChars ?? DEFAULT_MAX_RESPONSE_CHARS });
         console.log(describeSelection(selected, outputMode, collector.attemptCount));
+        if (selected.text) {
+          // #95: strip octo-artifact directives; cleanText is the ONLY user-visible
+          // body (history and delivery stay byte-identical). Local validation runs
+          // here so a rejected image never blocks the text delivery.
+          const extracted = extractArtifacts(selected.text);
+          if (extracted.artifacts.length > 0 || extracted.dropped > 0) {
+            const cwdDir = resolveSessionCwd(config.cwdBase ?? config.cwd, sessionCtx);
+            if (extracted.dropped > 0) {
+              console.warn(`[codex-channel-octo] outbound images over cap: ${extracted.dropped} artifact(s) dropped (max ${MAX_IMAGES_PER_MESSAGE})`);
+            }
+            for (const artifact of extracted.artifacts) {
+              const outcome = await prepareOutboundImage({ artifact, cwdDir });
+              if (outcome.ok) outboundImages.push(outcome.image);
+              else outboundImageFailures.push(outcome.result);
+            }
+          }
+          selected = { ...selected, text: extracted.cleanText };
+        }
         if (selected.text) {
           turn.assertPublishable();
           stage = 'history_commit'; turn.stage = stage;
@@ -811,7 +835,27 @@ export async function handleMessage(
       const isValidMentionUid = isGroup
         ? (uid: string): boolean => turnGroupContext.isMember(channelId, uid)
         : undefined;
-      await streamRelay.deliver(channelId, channelType, selectedChunks(), config.apiUrl, config.botToken, config.maxResponseChars, outboundNameToUid, isValidMentionUid, { turn, store: turnStore });
+      const deliveryReport = await streamRelay.deliver(channelId, channelType, selectedChunks(), config.apiUrl, config.botToken, config.maxResponseChars, outboundNameToUid, isValidMentionUid, { turn, store: turnStore }, outboundImages);
+
+      // #95: partial-success feedback — one compact notice listing every image
+      // that was not confirmed sent (sanitized stage tags + basenames only,
+      // never local paths, URLs or credentials). Best effort: a failed notice
+      // must not change the turn outcome.
+      const imageIssues = [
+        ...outboundImageFailures.map(r => `${r.name ?? 'image'} [${r.error ?? r.stage}]`),
+        ...deliveryReport.parts
+          .filter((p): p is ImageDeliveryPart => 'kind' in p && p.kind === 'image' && p.state !== 'sent')
+          .map(p => `${p.name} [${p.error ?? `${p.stage}:unconfirmed`}]`),
+      ];
+      if (imageIssues.length > 0) {
+        await sendMessage({
+          apiUrl: config.apiUrl,
+          botToken: config.botToken,
+          channelId,
+          channelType,
+          content: `图片发送未完成：${imageIssues.join('；')}`,
+        }).catch(() => { /* notice is best-effort */ });
+      }
 
       turn.assertPublishable();
       // G8: Send read receipt after processing (fire-and-forget)
@@ -827,8 +871,11 @@ export async function handleMessage(
 
       // --- Store assistant response in history ---
       // Same bytes the relay received (mention rendering is delivery-only).
+      // #95: an images-only reply (cleanText empty) also counts as a response —
+      // commitTurnOutput no-ops without a saved text row, and the fallback
+      // notice below must not fire when images were the payload.
       const fullResponse = selected?.text ?? '';
-      if (fullResponse) {
+      if (fullResponse || outboundImages.length > 0) {
         stage = 'history_commit'; turn.stage = stage;
         turn.assertPublishable();
         turnStore.commitTurnOutput(turn.turnId);
